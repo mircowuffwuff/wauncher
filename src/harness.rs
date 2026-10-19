@@ -217,6 +217,7 @@ pub fn prepare(h: Harness, s: &Session, cwd: &Path) -> Result<Prepared> {
             c.env("OPENAI_API_KEY", "ollama")
                 .env("OPENAI_BASE_URL", ollama::openai_base())
                 .env("OPENAI_MODEL", s.model)
+                .env("QWEN_CODE_SYSTEM_SETTINGS_PATH", qwen_system_settings(s.ctx)?)
                 .args(["--auth-type", "openai", "--model", s.model]);
             c
         }
@@ -238,6 +239,42 @@ pub fn prepare(h: Harness, s: &Session, cwd: &Path) -> Result<Prepared> {
     };
     cmd.current_dir(cwd);
     Ok(Prepared { command: cmd, edits })
+}
+
+/// Qwen Code sizes the context window from tables keyed on the model name and
+/// assumes 200k for a name it does not know, which an hf.co name is, so it
+/// would neither compact nor warn before the server's real context runs out.
+/// model.generationConfig.contextWindowSize sets the window. system settings
+/// rank above user and project settings, and QWEN_CODE_SYSTEM_SETTINGS_PATH
+/// picks the system settings file per process, so the launcher writes its own
+/// file into its state folder rather than editing one of the user's. it starts
+/// from the machine-wide system settings, which the variable would otherwise
+/// hide. a provider entry for the same model in the user's modelProviders
+/// keeps its own generationConfig, which this does not reach.
+fn qwen_system_settings(ctx: u64) -> Result<PathBuf> {
+    let machine = std::env::var_os("QWEN_CODE_SYSTEM_SETTINGS_PATH")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("ProgramData").map(|p| PathBuf::from(p).join("qwen-code").join("settings.json")));
+    let mut root = match machine.and_then(|p| std::fs::read(p).ok()) {
+        Some(b) => serde_json::from_slice(&b).context("the machine-wide Qwen Code settings are not valid JSON")?,
+        None => json!({}),
+    };
+    let Some(obj) = root.as_object_mut() else { bail!("the machine-wide Qwen Code settings are not a JSON object") };
+    let model = obj.entry("model").or_insert_with(|| json!({}));
+    if !model.is_object() {
+        *model = json!({});
+    }
+    let gen =
+        model.as_object_mut().expect("just made an object").entry("generationConfig").or_insert_with(|| json!({}));
+    if !gen.is_object() {
+        *gen = json!({});
+    }
+    gen.as_object_mut().expect("just made an object").insert("contextWindowSize".into(), json!(ctx));
+
+    let path = crate::state::dir().join("qwen-system-settings.json");
+    std::fs::create_dir_all(crate::state::dir())?;
+    std::fs::write(&path, serde_json::to_vec_pretty(&root)?).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
 }
 
 const PI_PROVIDER: &str = "wauncher";
@@ -405,6 +442,12 @@ mod tests {
             let text = String::from_utf8_lossy(&out.stdout).to_string();
             println!("== {}\n{text}", h.name());
             assert!(text.contains(&format!("cwd={}", work.display())), "{text}");
+            if h == Harness::Qwen {
+                let path =
+                    p.command.get_envs().find(|(k, _)| *k == "QWEN_CODE_SYSTEM_SETTINGS_PATH").unwrap().1.unwrap();
+                let settings: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                assert_eq!(settings["model"]["generationConfig"]["contextWindowSize"], 65536);
+            }
             for e in p.edits.drain(..) {
                 assert_eq!(e.restore().unwrap(), None);
             }
