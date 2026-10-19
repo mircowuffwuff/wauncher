@@ -20,7 +20,7 @@ the binary is `target\release\wauncher.exe`. `.cargo/config.toml` links the C ru
 cargo test
 ```
 
-runs the unit tests, the VRAM math among them. `cargo test live_ -- --ignored --nocapture < NUL` checks Free After against the real machine: for each model it predicts the free VRAM the way the model screen does, loads the model through the launch path — server restart, load, measurement, calibration, spill check — and prints the prediction beside the free VRAM really left, then does the same at the next context with the fresh calibration. `WAUNCHER_LIVE_RUNS` picks the runs, as `model=16,64;other-model=32`, contexts in k. it stops the local Ollama; a model that does not fit is declined at the prompt, which is why stdin comes from `NUL`. `cargo test stand_ins -- --ignored --nocapture` puts batch-file stand-ins for Pi, Hermes Agent and Qwen Code first on `PATH`, with their config folders in a temp directory, and prints the working directory, arguments, environment and config each one is started with.
+runs the unit tests, the VRAM math among them. `cargo test live_ -- --ignored --nocapture < NUL` checks Free After against the real machine: for each model it predicts the free VRAM the way the model screen does, loads the model through the launch path — server restart, load, measurement, calibration, spill check — and prints the prediction beside the free VRAM really left, then does the same at the next context with the fresh calibration. `WAUNCHER_LIVE_RUNS` picks the runs, as `model=16,64;other-model=32`, contexts in k. it stops the local Ollama; a model that does not fit is declined at the prompt, which is why stdin comes from `NUL`. `cargo test stand_ins -- --ignored --nocapture` puts batch-file stand-ins for Pi, Hermes Agent and Qwen Code first on `PATH`, with their config folders in a temp directory, and prints the working directory, arguments, environment and config each one is started with; for Qwen Code it also checks the context window in the session's settings file.
 
 `wauncher --list` prints the GPUs and the model table once and exits, without touching the server.
 
@@ -78,17 +78,27 @@ the tray app stays stopped after a launch. start it again from the Start menu to
 
 | harness | method | files touched |
 | --- | --- | --- |
-| Claude Code | `ollama launch claude --model <m>`, plus `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and `CLAUDE_CODE_AUTO_COMPACT_WINDOW` set to the effective context, which `ollama launch` only sets for cloud models | none |
+| Claude Code | `ollama launch claude --model <m>`, plus `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and `CLAUDE_CODE_AUTO_COMPACT_WINDOW` set to the effective context, which `ollama launch` only sets for cloud models. a model whose chat template rejects Claude Code's requests runs as a derived model, see below | none; a derived model for the session |
 | OpenCode | `ollama launch opencode --model <m>`, which passes its config in `OPENCODE_CONFIG_CONTENT` | none |
-| Qwen Code | `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` and `--auth-type openai --model <m>`; environment and flags rank above `settings.json` | none |
+| Qwen Code | `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL` and `--auth-type openai --model <m>`; environment and flags rank above `settings.json`. the context window goes in through `QWEN_CODE_SYSTEM_SETTINGS_PATH`, see below | none; wauncher's own `qwen-system-settings.json` |
 | Pi | a `wauncher` provider in `models.json` (`%PI_CODING_AGENT_DIR%` or `~\.pi\agent`), then `pi --provider wauncher --model <m>`. Pi has no flag or variable for a custom endpoint | `models.json`, restored on exit |
 | Hermes Agent | the `model:` block Hermes documents for a local Ollama — `provider: custom`, `base_url`, `context_length`, `ollama_num_ctx` — in `config.yaml` (`%HERMES_HOME%` or `%LOCALAPPDATA%\hermes`). `OPENAI_BASE_URL` alone loses to a `model.provider` already in `config.yaml` | `config.yaml`, restored on exit |
 
-`ollama launch` starts both of its harnesses without setting a working directory, so they inherit wauncher's. a harness that is not on `PATH` is also looked for where its installer puts it: `~\.local\bin` for Claude Code, `%APPDATA%\npm` for the npm-installed ones, and the Hermes venv under `%LOCALAPPDATA%\hermes`.
+`ollama launch` starts both of its harnesses without setting a working directory, so they inherit wauncher's. a harness that is not on `PATH` is also looked for where its installer puts it: `~\.local\bin` for Claude Code, `%APPDATA%\npm` for the npm-installed ones, `~\.pi\agent\bin` for Pi, `%LOCALAPPDATA%\qwen-code\bin` for Qwen Code, and the Hermes venv under `%LOCALAPPDATA%\hermes`.
 
 an edited file is copied to `<file>.wauncher-backup` first. on exit the original goes back, unless something else changed the file during the session — then the file stays as it is, and the backup stays beside it. a backup still present at the next launch means a session never got to restore it, and wauncher takes the backup as the original.
 
 Hermes needs at least 64,000 tokens of context; the harness screen warns when the effective context is below that.
+
+#### Claude Code and Qwen's GGUF templates
+
+Claude Code sends its environment block as a system message after the first user message, and Ollama's Anthropic endpoint passes it through. the chat template Qwen ships inside its GGUF files — which Ollama uses for any model imported from Hugging Face — raises `System message must be at the beginning` on that, so every request fails with a 500 before the model generates anything. models from Ollama's own library are not affected: they use Ollama's built-in `qwen3.5` and `qwen3.8` renderers, which accept such a message.
+
+so for Claude Code, wauncher checks the selected model: a `qwen35` model whose template contains that check and that has no renderer of its own is served as `wauncher/<name>:<tag>`, a model created from it with Ollama's renderer and parser — `qwen3.8` for a Qwen3.8 model, `qwen3.5` otherwise. it shares the original's blobs, so it costs no disk and no VRAM beyond the original. wauncher removes it when the session ends, keeps calibration under the original's name, and never lists `wauncher/` models on the model screen. the other harnesses use the OpenAI-compatible endpoint, where these models answer them without the error, and run the model as it is.
+
+#### Qwen Code's context window
+
+Qwen Code sizes the context window from tables keyed on the model name and assumes 200k for a name it does not know — which a Hugging Face name is — so it neither compacts nor warns before the server's real context runs out. `model.generationConfig.contextWindowSize` sets the window. system settings rank above user and project settings, and `QWEN_CODE_SYSTEM_SETTINGS_PATH` picks the system settings file per process, so wauncher writes `%APPDATA%\wauncher\qwen-system-settings.json` with the effective context and points Qwen Code at it, without touching the user's `settings.json`. the file starts from the machine-wide system settings (`%ProgramData%\qwen-code\settings.json`), which the variable would otherwise hide. a `modelProviders` entry for the same model in the user's settings keeps its own `generationConfig`, which this does not reach. measured with Qwen Code 0.25.1, its compaction check reports `contextLimit=200000` without the file and `contextLimit=32768` with a 32k session.
 
 ## the VRAM estimate
 
@@ -170,6 +180,7 @@ a negative error is a pessimistic prediction, and the fresh column was measured 
 | --- | --- |
 | `%APPDATA%\wauncher\state.json` | last model, last harness, slider value, KV type, calibration, server settings, the server wauncher started |
 | `%APPDATA%\wauncher\ollama-serve.log` | output of the last `ollama serve` wauncher started |
+| `%APPDATA%\wauncher\qwen-system-settings.json` | the system settings the last Qwen Code session ran with |
 
 the last model is saved when `Enter` leaves the model screen, together with the slider and KV type; the last harness when `Enter` launches it. an unreadable `state.json` is moved to `state.json.broken` and the defaults are used.
 
