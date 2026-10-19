@@ -96,8 +96,14 @@ impl Harness {
                 npm.map(|n| n.join("opencode.cmd")),
                 home.map(|h| h.join(".opencode").join("bin").join("opencode.exe")),
             ],
-            Harness::Pi => vec![npm.map(|n| n.join("pi.cmd"))],
-            Harness::Qwen => vec![npm.map(|n| n.join("qwen.cmd"))],
+            Harness::Pi => vec![
+                npm.map(|n| n.join("pi.cmd")),
+                home.map(|h| h.join(".pi").join("agent").join("bin").join("pi.cmd")),
+            ],
+            Harness::Qwen => vec![
+                npm.map(|n| n.join("qwen.cmd")),
+                env("LOCALAPPDATA").map(|l| l.join("qwen-code").join("bin").join("qwen.cmd")),
+            ],
             Harness::Hermes => {
                 let venv = |root: PathBuf| root.join("hermes-agent").join("venv").join("Scripts").join("hermes.exe");
                 vec![env("HERMES_HOME").map(venv), env("LOCALAPPDATA").map(|l| venv(l.join("hermes")))]
