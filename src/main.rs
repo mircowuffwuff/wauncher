@@ -48,6 +48,9 @@ fn install_ctrl_handler() {}
 fn load_models() -> Result<Vec<ModelRow>> {
     let mut rows = Vec::new();
     for t in ollama::tags()? {
+        if t.name.starts_with(ollama::OWN_NAMESPACE) {
+            continue;
+        }
         // a model removed between /api/tags and /api/show is skipped, not fatal
         let Ok(show) = ollama::show(&t.name) else { continue };
         if !show.capabilities.iter().any(|c| c == "tools") {

@@ -97,26 +97,57 @@ pub fn run(req: &Request, st: &mut State, cancel: &AtomicBool) -> Result<()> {
         req.kv.as_str()
     ));
 
-    if !load_checked(req, st, cancel)? {
+    let Some(served) = load_checked(req, st, cancel)? else {
         return Ok(());
-    }
+    };
 
-    let session = Session { model: &req.model, ctx: req.ctx, thinking: req.thinking, vision: req.vision };
+    let session = Session { model: &served, ctx: req.ctx, thinking: req.thinking, vision: req.vision };
     let result = run_harness(req.harness, &session, req);
 
     log("unloading the model");
-    if let Err(e) = ollama::load(&req.model, 0) {
+    if let Err(e) = ollama::load(&served, 0) {
         warn(format!("unloading failed -- {e:#}"));
     }
+    drop_served(req, &served);
     result
 }
 
+/// the model the harness is pointed at: the selected one, or a model derived
+/// from it with Ollama's built-in renderer where its own chat template cannot
+/// take the harness's requests
+fn served_model(req: &Request) -> Result<String> {
+    if req.harness != Harness::Claude {
+        return Ok(req.model.clone());
+    }
+    let show = ollama::show(&req.model)?;
+    let Some(renderer) = ollama::renderer_for_claude(&show) else {
+        return Ok(req.model.clone());
+    };
+    let name = ollama::derived_name(&req.model);
+    log(format!(
+        "the model's own chat template rejects Claude Code's requests -- serving it as {name} with Ollama's {renderer} renderer"
+    ));
+    ollama::create_with_renderer(&name, &req.model, renderer).context("creating the derived model")?;
+    Ok(name)
+}
+
+/// removes a model served_model derived; it shares its blobs with the selected model
+fn drop_served(req: &Request, served: &str) {
+    if served != req.model {
+        if let Err(e) = ollama::delete(served) {
+            warn(format!("removing {served} failed -- {e:#}"));
+        }
+    }
+}
+
 /// steps 2 to 4: the server with the right settings, the model loaded and
-/// measured, calibration saved. false when the user declined a model that did
-/// not fit, which is then unloaded again.
-fn load_checked(req: &Request, st: &mut State, cancel: &AtomicBool) -> Result<bool> {
+/// measured, calibration saved. returns the model the harness is to use, or
+/// None when the user declined a model that did not fit, which is then
+/// unloaded again.
+fn load_checked(req: &Request, st: &mut State, cancel: &AtomicBool) -> Result<Option<String>> {
     let want = ServerSettings { ctx: req.ctx, kv: req.kv, env: st.server_env() };
     ensure_server(&want, st, cancel)?;
+    let served = served_model(req)?;
 
     // the model's real footprint is the rise in dedicated usage across the load.
     // a restarted server's old runner may still be releasing its memory, so the
@@ -129,9 +160,10 @@ fn load_checked(req: &Request, st: &mut State, cancel: &AtomicBool) -> Result<bo
 
     log(format!("loading {} (estimated {})", req.model, gib(req.estimate.total().max(0) as u64)));
     let started = Instant::now();
-    let model = req.model.clone();
+    let model = served.clone();
     if let Err(e) = cancellable(cancel, move || ollama::load(&model, -1)) {
-        let _ = ollama::load(&req.model, 0);
+        let _ = ollama::load(&served, 0);
+        drop_served(req, &served);
         return Err(e.context("loading the model"));
     }
     log(format!("loaded in {:.0}s", started.elapsed().as_secs_f64()));
@@ -139,7 +171,7 @@ fn load_checked(req: &Request, st: &mut State, cancel: &AtomicBool) -> Result<bo
     let after = gpu::used(&mut sampler, &adapters);
 
     let running = ollama::ps()?;
-    let r = ollama::find_running(&running, &req.model).context("the model is not in /api/ps after loading")?.clone();
+    let r = ollama::find_running(&running, &served).context("the model is not in /api/ps after loading")?.clone();
     if r.context_length > 0 && r.context_length != req.ctx {
         warn(format!(
             "the model runs with {} tokens of context, not {} -- its Modelfile may set num_ctx",
@@ -194,11 +226,12 @@ fn load_checked(req: &Request, st: &mut State, cancel: &AtomicBool) -> Result<bo
         }
         if !confirm("continue anyway?") {
             log("unloading the model");
-            ollama::load(&req.model, 0)?;
-            return Ok(false);
+            ollama::load(&served, 0)?;
+            drop_served(req, &served);
+            return Ok(None);
         }
     }
-    Ok(true)
+    Ok(Some(served))
 }
 
 fn run_harness(h: Harness, s: &Session, req: &Request) -> Result<()> {
@@ -264,7 +297,7 @@ mod tests {
                     model: model.clone(),
                     ctx,
                     kv: KvType::Q8_0,
-                    harness: Harness::Claude,
+                    harness: Harness::Pi,
                     thinking: true,
                     vision: true,
                     estimate: est,
@@ -278,7 +311,8 @@ mod tests {
                 let others = crate::gpu::used(&mut sampler, &adapters).unwrap();
                 let predicted = usable as i64 - others as i64 - est.total();
                 let calibrated = st.corrections.contains_key(&model);
-                let proceeded = load_checked(&req, &mut st, &cancel).unwrap();
+                let served = load_checked(&req, &mut st, &cancel).unwrap();
+                let proceeded = served.is_some();
                 let after = crate::gpu::used(&mut sampler, &adapters).unwrap();
                 let real = usable as i64 - after as i64;
                 println!(
@@ -290,7 +324,10 @@ mod tests {
                     (predicted - real) as f64 / GIB,
                     if proceeded { "" } else { " (declined: did not fit)" }
                 );
-                let _ = ollama::load(&model, 0);
+                if let Some(served) = served {
+                    let _ = ollama::load(&served, 0);
+                    drop_served(&req, &served);
+                }
                 std::thread::sleep(Duration::from_secs(2));
             }
         }
